@@ -127,6 +127,31 @@ function calculateSuggestion(previousSets) {
   };
 }
 
+
+const BODY_PARTS = ['Biceps', 'Triceps', 'Chest', 'Back', 'Legs', 'Shoulders'];
+
+// Default category for the built-in weekly routine. Custom exercises receive
+// an explicit category chosen by the user and saved on workout_exercises.
+function getRoutineBodyPart(exerciseName) {
+  const normalizedName = String(exerciseName || '').trim().toLowerCase();
+  const bodyPartByDay = {
+    1: 'Shoulders', 2: 'Biceps', 3: 'Chest',
+    4: 'Triceps', 5: 'Legs', 6: 'Back',
+  };
+  for (const [day, routine] of Object.entries(PLAN)) {
+    if (routine.exercises.some((name) => name.trim().toLowerCase() === normalizedName)) {
+      return bodyPartByDay[day] || null;
+    }
+  }
+  return null;
+}
+
+function getBodyPartForExercise(workout) {
+  // Prefer the category explicitly stored with the exercise. Fall back to the
+  // built-in routine mapping for records created before body_part was added.
+  return workout?.bodyPart || getRoutineBodyPart(workout?.exercise);
+}
+
 export default function App() {
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -137,6 +162,7 @@ export default function App() {
 
   // App tabs & date
   const [activeTab, setActiveTab] = useState('workout');
+  const [selectedHistoryCategory, setSelectedHistoryCategory] = useState(null);
   const todayStr = useMemo(() => formatLocalDate(new Date()), []);
   const [selectedDate, setSelectedDate] = useState(todayStr);
 
@@ -162,7 +188,13 @@ export default function App() {
   // Active workout editor
   const [expandedExercise, setExpandedExercise] = useState(null);
   const [activeSets, setActiveSets] = useState([]);
+  const [activeExerciseNotes, setActiveExerciseNotes] = useState('');
+  const [activeExerciseBodyPart, setActiveExerciseBodyPart] = useState(null);
+  const [editingHistoryNoteId, setEditingHistoryNoteId] = useState(null);
+  const [editingHistoryNoteText, setEditingHistoryNoteText] = useState('');
   const [customExerciseInput, setCustomExerciseInput] = useState('');
+  const [customExerciseBodyPart, setCustomExerciseBodyPart] = useState('');
+  const [customExerciseBodyParts, setCustomExerciseBodyParts] = useState({});
   const [showAddExercise, setShowAddExercise] = useState(false);
   const [customExercisesByDate, setCustomExercisesByDate] = useState({});
 
@@ -214,7 +246,7 @@ export default function App() {
 
         const { data: exerciseRows, error: exerciseError } = await supabase
           .from('workout_exercises')
-          .select('id, session_id, exercise_name, order_index')
+          .select('id, session_id, exercise_name, order_index, body_part, notes')
           .in('session_id', sessionIds);
 
         if (exerciseError) throw exerciseError;
@@ -238,8 +270,11 @@ export default function App() {
         );
 
         mappedWorkouts = (exerciseRows || []).map((exercise) => ({
+          id: exercise.id,
           date: sessionDateById[exercise.session_id],
           exercise: exercise.exercise_name,
+          notes: exercise.notes || '',
+          bodyPart: exercise.body_part || null,
           sets: setRows
             .filter((set) =>
               set.workout_exercise_id === exercise.id && !set.is_warmup
@@ -403,6 +438,11 @@ export default function App() {
       return;
     }
 
+    if (!customExerciseBodyPart) {
+      Alert.alert('Body Part Required', 'Choose the body part for this exercise.');
+      return;
+    }
+
     const alreadyExists = selectedDayExerciseNames.some(
       (name) => name.toLowerCase() === exerciseName.toLowerCase()
     );
@@ -414,15 +454,19 @@ export default function App() {
 
     setCustomExercisesByDate((previous) => ({
       ...previous,
-      [selectedDate]: [
-        ...(previous[selectedDate] || []),
-        exerciseName,
-      ],
+      [selectedDate]: [...(previous[selectedDate] || []), exerciseName],
+    }));
+    setCustomExerciseBodyParts((previous) => ({
+      ...previous,
+      [`${selectedDate}|${exerciseName}`]: customExerciseBodyPart,
     }));
 
     setCustomExerciseInput('');
+    setCustomExerciseBodyPart('');
     setShowAddExercise(false);
-    handleOpenExercise(exerciseName);
+    // Pass the selected category directly into the editor so saving does not
+    // depend on a separately updated state map.
+    handleOpenExercise(exerciseName, customExerciseBodyPart);
   }
 
   const weekDates = useWeekDatesMemo(selectedDate);
@@ -453,7 +497,7 @@ export default function App() {
   }
 
   // Open exercise editor
-  function handleOpenExercise(exerciseName) {
+  function handleOpenExercise(exerciseName, bodyPartOverride = null) {
     if (expandedExercise === exerciseName) {
       setExpandedExercise(null);
       return;
@@ -465,11 +509,35 @@ export default function App() {
       (w) => w.exercise === exerciseName
     );
 
+    const prev = getPrevSession(exerciseName);
+    const suggestion = calculateSuggestion(prev?.sets);
+
+    setActiveExerciseNotes(existing?.notes || '');
+    setActiveExerciseBodyPart(
+      bodyPartOverride ||
+      customExerciseBodyParts[`${selectedDate}|${exerciseName}`] ||
+      existing?.bodyPart ||
+      getRoutineBodyPart(exerciseName) ||
+      null
+    );
+
     if (existing && existing.sets?.length > 0) {
-      setActiveSets(existing.sets.map((s) => ({ ...s, done: true })));
+      // Keep already-saved sets completed, and restore the remaining default
+      // set rows so an accidental early save does not end the exercise.
+      const savedSets = existing.sets.map((s) => ({ ...s, done: true }));
+      const lastSavedSet = savedSets[savedSets.length - 1];
+      const setsArray = [...savedSets];
+
+      while (setsArray.length < DEFAULT_SETS) {
+        setsArray.push({
+          w: lastSavedSet?.w ?? suggestion.suggestedWeight,
+          r: lastSavedSet?.r ?? suggestion.targetReps,
+          done: false,
+        });
+      }
+
+      setActiveSets(setsArray);
     } else {
-      const prev = getPrevSession(exerciseName);
-      const suggestion = calculateSuggestion(prev?.sets);
       const setsArray = [];
 
       for (let i = 0; i < DEFAULT_SETS; i++) {
@@ -539,7 +607,7 @@ export default function App() {
         error: exerciseLookupError,
       } = await supabase
         .from('workout_exercises')
-        .select('id')
+        .select('id, body_part, notes')
         .eq('session_id', workoutSession.id)
         .eq('exercise_name', exerciseName)
         .limit(1)
@@ -547,24 +615,46 @@ export default function App() {
 
       if (exerciseLookupError) throw exerciseLookupError;
 
+      const exerciseBodyPart =
+        activeExerciseBodyPart ||
+        customExerciseBodyParts[`${selectedDate}|${exerciseName}`] ||
+        getRoutineBodyPart(exerciseName) ||
+        workoutExercise?.body_part ||
+        null;
+
       if (!workoutExercise) {
         const { data, error } = await supabase
           .from('workout_exercises')
           .insert({
             session_id: workoutSession.id,
             exercise_name: exerciseName,
+            body_part: exerciseBodyPart,
+            notes: activeExerciseNotes.trim() || null,
             order_index:
               selectedDayPlan.exercises.indexOf(exerciseName) >= 0
                 ? selectedDayPlan.exercises.indexOf(exerciseName)
                 : selectedDayPlan.exercises.length + selectedDayWorkouts.length,
             rest_seconds: REST_TIME,
           })
-          .select('id')
+          .select('id, body_part')
           .single();
 
         if (error) throw error;
         workoutExercise = data;
+      } else if (exerciseBodyPart && workoutExercise.body_part !== exerciseBodyPart) {
+        const { error: categoryError } = await supabase
+          .from('workout_exercises')
+          .update({ body_part: exerciseBodyPart })
+          .eq('id', workoutExercise.id);
+        if (categoryError) throw categoryError;
       }
+
+      const exerciseNotes = activeExerciseNotes.trim();
+      const { error: notesError } = await supabase
+        .from('workout_exercises')
+        .update({ notes: exerciseNotes || null })
+        .eq('id', workoutExercise.id);
+      if (notesError) throw notesError;
 
       // Replace the set rows for this exercise.
       const { error: deleteError } = await supabase
@@ -589,8 +679,11 @@ export default function App() {
       if (insertSetsError) throw insertSetsError;
 
       const localWorkout = {
+        id: workoutExercise.id,
         date: selectedDate,
         exercise: exerciseName,
+        notes: exerciseNotes,
+        bodyPart: exerciseBodyPart || workoutExercise.body_part || null,
         sets: completedSets.map((set) => ({
           ...set,
           done: true,
@@ -905,7 +998,10 @@ export default function App() {
         {['workout', 'history'].map((tab) => (
           <TouchableOpacity
             key={tab}
-            onPress={() => setActiveTab(tab)}
+            onPress={() => {
+              setActiveTab(tab);
+              if (tab === 'history') setSelectedHistoryCategory(null);
+            }}
             style={{
               flex: 1,
               paddingVertical: 12,
@@ -1010,12 +1106,29 @@ export default function App() {
                     returnKeyType="done"
                     onSubmitEditing={handleAddCustomExercise}
                   />
+                  <Text style={styles.formLabel}>Choose body part *</Text>
+                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
+                    {BODY_PARTS.map((part) => (
+                      <TouchableOpacity
+                        key={part}
+                        onPress={() => setCustomExerciseBodyPart(part)}
+                        style={{
+                          paddingVertical: 8, paddingHorizontal: 11, borderRadius: 18,
+                          backgroundColor: customExerciseBodyPart === part ? '#e0a800' : '#222830',
+                          borderWidth: 1, borderColor: customExerciseBodyPart === part ? '#e0a800' : '#394149',
+                        }}
+                      >
+                        <Text style={{ color: customExerciseBodyPart === part ? '#101316' : '#fff', fontSize: 12, fontWeight: '700' }}>{part}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
                   <View style={styles.addExerciseActions}>
                     <TouchableOpacity
                       style={styles.cancelAddExerciseButton}
                       onPress={() => {
                         setShowAddExercise(false);
                         setCustomExerciseInput('');
+                        setCustomExerciseBodyPart('');
                       }}
                     >
                       <Text style={styles.cancelAddExerciseText}>Cancel</Text>
@@ -1151,6 +1264,44 @@ export default function App() {
                           </TouchableOpacity>
                         </View>
                       ))}
+
+                      <Text style={styles.formLabel}>Exercise notes (optional)</Text>
+                      <TextInput
+                        style={[styles.formInput, { minHeight: 82, textAlignVertical: 'top' }]}
+                        value={activeExerciseNotes}
+                        onChangeText={setActiveExerciseNotes}
+                        placeholder="e.g. Used a wider grip, reduced weight, slower negative, adjusted form..."
+                        placeholderTextColor="#66717c"
+                        multiline
+                      />
+
+                      <TouchableOpacity
+                        onPress={() => {
+                          const lastSet = activeSets[activeSets.length - 1];
+                          const prev = getPrevSession(name);
+                          const suggestion = calculateSuggestion(prev?.sets);
+                          setActiveSets((current) => [
+                            ...current,
+                            {
+                              w: lastSet?.w ?? suggestion.suggestedWeight,
+                              r: lastSet?.r ?? suggestion.targetReps,
+                              done: false,
+                            },
+                          ]);
+                        }}
+                        style={{
+                          paddingVertical: 12,
+                          alignItems: 'center',
+                          marginBottom: 10,
+                          borderRadius: 10,
+                          borderWidth: 1,
+                          borderColor: '#e0a800',
+                        }}
+                      >
+                        <Text style={{ color: '#e0a800', fontWeight: '800' }}>
+                          + Add Set
+                        </Text>
+                      </TouchableOpacity>
 
                       <TouchableOpacity
                         style={styles.saveBtn}
@@ -1406,104 +1557,234 @@ export default function App() {
           </ScrollView>
         </>
       )}
-            {/* History Screen */}
+            {/* History Screen: body-part categories and combined Cardio / Abs */}
       {activeTab === 'history' && (
         <ScrollView style={styles.scrollArea}>
-          <View style={styles.dayRoutineCard}>
-            <Text style={styles.routineDayName}>YOUR PROGRESS</Text>
-            <Text style={styles.routineTheme}>Workout History</Text>
-            <Text style={styles.suggestionSmall}>
-              {historyDates.length} active days recorded
-            </Text>
-          </View>
+          {selectedHistoryCategory === null ? (
+            <>
+              <View style={styles.dayRoutineCard}>
+                <Text style={styles.routineDayName}>YOUR PROGRESS</Text>
+                <Text style={styles.routineTheme}>Workout History</Text>
+                <Text style={styles.suggestionSmall}>
+                  {historyDates.length} active days recorded
+                </Text>
+              </View>
 
-          {historyDates.length === 0 ? (
-            <View style={styles.dayRoutineCard}>
-              <Text style={styles.exerciseTitle}>
-                No workout history yet
-              </Text>
-              <Text style={styles.suggestionSmall}>
-                Your saved workouts, cardio and abs sessions will appear here.
-              </Text>
-            </View>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' }}>
+                {[
+                  { name: 'Biceps', icon: '💪' },
+                  { name: 'Triceps', icon: '🏋️' },
+                  { name: 'Chest', icon: '🫁' },
+                  { name: 'Back', icon: '🔙' },
+                  { name: 'Legs', icon: '🦵' },
+                  { name: 'Shoulders', icon: '🏋️' },
+                  { name: 'Cardio / Abs', icon: '🏃' },
+                ].map((category) => {
+                  const categoryDates = category.name === 'Cardio / Abs'
+                    ? [...new Set([
+                        ...cardioSessions.map((item) => item.activity_date),
+                        ...abSessions.map((item) => item.activity_date),
+                      ])]
+                    : [...new Set(
+                        workouts
+                          .filter((item) => getBodyPartForExercise(item) === category.name)
+                          .map((item) => item.date)
+                      )];
+
+                  return (
+                    <TouchableOpacity
+                      key={category.name}
+                      style={{
+                        width: category.name === 'Cardio / Abs' ? '100%' : '48.5%',
+                        backgroundColor: '#1a1f24',
+                        borderRadius: 14,
+                        borderWidth: 1,
+                        borderColor: '#2a3138',
+                        padding: 18,
+                        marginBottom: 12,
+                      }}
+                      onPress={() => setSelectedHistoryCategory(category.name)}
+                      activeOpacity={0.75}
+                    >
+                      <Text style={{ fontSize: 25, marginBottom: 10 }}>{category.icon}</Text>
+                      <Text style={styles.exerciseTitle}>{category.name}</Text>
+                      <Text style={styles.suggestionSmall}>
+                        {categoryDates.length} training {categoryDates.length === 1 ? 'day' : 'days'}
+                      </Text>
+                      <Text style={{ color: '#e0a800', fontSize: 12, fontWeight: '700', marginTop: 12 }}>
+                        View history  →
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </>
           ) : (
-            historyDates.map((date) => {
-              const dayWorkouts = workouts.filter(
-                (item) => item.date === date
-              );
-              const dayCardio = cardioSessions.filter(
-                (item) => item.activity_date === date
-              );
-              const dayAbs = abSessions.filter(
-                (item) => item.activity_date === date
-              );
-              const displayDate = new Date(
-                `${date}T00:00:00`
-              ).toLocaleDateString('en-IN', {
-                weekday: 'long',
-                day: 'numeric',
-                month: 'short',
-                year: 'numeric',
-              });
+            <>
+              <TouchableOpacity
+                onPress={() => setSelectedHistoryCategory(null)}
+                style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 10, marginBottom: 8 }}
+              >
+                <Text style={{ color: '#e0a800', fontSize: 15, fontWeight: '800' }}>‹  ALL HISTORY</Text>
+              </TouchableOpacity>
 
-              return (
-                <View key={date} style={styles.exerciseCard}>
-                  <View style={{ padding: 16 }}>
-                    <Text style={styles.routineDayName}>
-                      {displayDate}
-                    </Text>
+              <View style={styles.dayRoutineCard}>
+                <Text style={styles.routineDayName}>TRAINING HISTORY</Text>
+                <Text style={styles.routineTheme}>{selectedHistoryCategory}</Text>
+                <Text style={styles.suggestionSmall}>Your sessions, newest first</Text>
+              </View>
 
-                    {dayWorkouts.map((item, index) => (
-                      <View key={`${item.exercise}-${index}`}>
-                        <Text style={styles.exerciseTitle}>
-                          {item.exercise}
-                        </Text>
-                        {item.sets?.map((set, setIndex) => (
-                          <Text key={setIndex} style={styles.savedExtraText}>
-                            Set {setIndex + 1}: {set.w} kg × {set.r} reps
-                          </Text>
-                        ))}
+              {selectedHistoryCategory === 'Cardio / Abs' ? (
+                (() => {
+                  const activityDates = [...new Set([
+                    ...cardioSessions.map((item) => item.activity_date),
+                    ...abSessions.map((item) => item.activity_date),
+                  ])].sort((a, b) => b.localeCompare(a));
+
+                  if (activityDates.length === 0) {
+                    return (
+                      <View style={styles.dayRoutineCard}>
+                        <Text style={styles.exerciseTitle}>No Cardio or Abs history yet</Text>
+                        <Text style={styles.suggestionSmall}>Your saved cardio and abs activities will appear here.</Text>
                       </View>
-                    ))}
+                    );
+                  }
 
-                    {dayCardio.map((item) => (
-                      <View key={item.id} style={{ marginTop: 12 }}>
-                        <Text style={styles.exerciseTitle}>
-                          Cardio · {item.activity}
-                        </Text>
-                        <Text style={styles.savedExtraText}>
-                          Duration: {item.duration_minutes} minutes
-                        </Text>
-                        {item.distance_km != null && (
-                          <Text style={styles.savedExtraText}>
-                            Distance: {item.distance_km} km
-                          </Text>
-                        )}
-                        {item.calories_burned != null && (
-                          <Text style={styles.savedExtraText}>
-                            Calories: {item.calories_burned} kcal
-                          </Text>
-                        )}
-                      </View>
-                    ))}
+                  return activityDates.map((date) => {
+                    const dayCardio = cardioSessions.filter((item) => item.activity_date === date);
+                    const dayAbs = abSessions.filter((item) => item.activity_date === date);
+                    const displayDate = new Date(`${date}T00:00:00`).toLocaleDateString('en-IN', {
+                      weekday: 'long', day: 'numeric', month: 'short', year: 'numeric',
+                    });
 
-                    {dayAbs.map((item) => (
-                      <View key={item.id} style={{ marginTop: 12 }}>
-                        <Text style={styles.exerciseTitle}>
-                          Abs · {item.exercise_name}
-                        </Text>
-                        <Text style={styles.savedExtraText}>
-                          {item.sets} sets × {item.reps} reps
-                          {Number(item.weight) > 0
-                            ? ` · ${item.weight} kg`
-                            : ''}
-                        </Text>
+                    return (
+                      <View key={date} style={styles.exerciseCard}>
+                        <View style={{ padding: 16 }}>
+                          <Text style={styles.routineDayName}>{displayDate}</Text>
+                          {dayCardio.map((item) => (
+                            <View key={`cardio-${item.id}`} style={{ marginTop: 12 }}>
+                              <Text style={styles.exerciseTitle}>🏃 Cardio · {item.activity}</Text>
+                              <Text style={styles.savedExtraText}>Duration: {item.duration_minutes} minutes</Text>
+                              {item.distance_km != null && <Text style={styles.savedExtraText}>Distance: {item.distance_km} km</Text>}
+                              {item.calories_burned != null && <Text style={styles.savedExtraText}>Calories: {item.calories_burned} kcal</Text>}
+                              {!!item.notes && <Text style={styles.savedExtraText}>Notes: {item.notes}</Text>}
+                            </View>
+                          ))}
+                          {dayAbs.map((item) => (
+                            <View key={`abs-${item.id}`} style={{ marginTop: 12 }}>
+                              <Text style={styles.exerciseTitle}>🔥 Abs · {item.exercise_name}</Text>
+                              <Text style={styles.savedExtraText}>
+                                {item.sets} sets × {item.reps} reps
+                                {Number(item.weight) > 0 ? ` · ${item.weight} kg` : ''}
+                              </Text>
+                              {!!item.notes && <Text style={styles.savedExtraText}>Notes: {item.notes}</Text>}
+                            </View>
+                          ))}
+                        </View>
                       </View>
-                    ))}
-                  </View>
-                </View>
-              );
-            })
+                    );
+                  });
+                })()
+              ) : (
+                (() => {
+                  const categoryWorkouts = workouts.filter(
+                    (item) => getBodyPartForExercise(item) === selectedHistoryCategory
+                  );
+                  const categoryDates = [...new Set(categoryWorkouts.map((item) => item.date))]
+                    .sort((a, b) => b.localeCompare(a));
+
+                  if (categoryDates.length === 0) {
+                    return (
+                      <View style={styles.dayRoutineCard}>
+                        <Text style={styles.exerciseTitle}>No {selectedHistoryCategory} history yet</Text>
+                        <Text style={styles.suggestionSmall}>Saved {selectedHistoryCategory.toLowerCase()} workouts will appear here.</Text>
+                      </View>
+                    );
+                  }
+
+                  return categoryDates.map((date) => {
+                    const dayWorkouts = categoryWorkouts.filter((item) => item.date === date);
+                    const displayDate = new Date(`${date}T00:00:00`).toLocaleDateString('en-IN', {
+                      weekday: 'long', day: 'numeric', month: 'short', year: 'numeric',
+                    });
+
+                    return (
+                      <View key={date} style={styles.exerciseCard}>
+                        <View style={{ padding: 16 }}>
+                          <Text style={styles.routineDayName}>{displayDate}</Text>
+                          {dayWorkouts.map((item, index) => (
+                            <View key={`${item.exercise}-${index}`} style={{ marginTop: 12 }}>
+                              <Text style={styles.exerciseTitle}>{item.exercise}</Text>
+                              {item.sets?.map((set, setIndex) => (
+                                <Text key={setIndex} style={styles.savedExtraText}>
+                                  Set {setIndex + 1}: {set.w} kg × {set.r} reps
+                                </Text>
+                              ))}
+                              {!!item.notes && (
+                                <Text style={[styles.savedExtraText, { marginTop: 6 }]}>Notes: {item.notes}</Text>
+                              )}
+                              <TouchableOpacity
+                                onPress={() => {
+                                  setEditingHistoryNoteId(item.id);
+                                  setEditingHistoryNoteText(item.notes || '');
+                                }}
+                                style={{ alignSelf: 'flex-start', marginTop: 8 }}
+                              >
+                                <Text style={{ color: '#e0a800', fontSize: 12, fontWeight: '800' }}>
+                                  {editingHistoryNoteId === item.id ? 'Editing note' : (item.notes ? 'Edit note' : '＋ Add note')}
+                                </Text>
+                              </TouchableOpacity>
+                              {editingHistoryNoteId === item.id && (
+                                <View style={{ marginTop: 8 }}>
+                                  <TextInput
+                                    style={[styles.formInput, { minHeight: 78, textAlignVertical: 'top' }]}
+                                    value={editingHistoryNoteText}
+                                    onChangeText={setEditingHistoryNoteText}
+                                    placeholder="Add exercise variations or observations..."
+                                    placeholderTextColor="#66717c"
+                                    multiline
+                                  />
+                                  <View style={{ flexDirection: 'row', gap: 10, marginTop: 8 }}>
+                                    <TouchableOpacity
+                                      onPress={() => setEditingHistoryNoteId(null)}
+                                      style={styles.cancelAddExerciseButton}
+                                    >
+                                      <Text style={styles.cancelAddExerciseText}>Cancel</Text>
+                                    </TouchableOpacity>
+                                    <TouchableOpacity
+                                      onPress={async () => {
+                                        try {
+                                          const updatedNote = editingHistoryNoteText.trim();
+                                          const { error } = await supabase
+                                            .from('workout_exercises')
+                                            .update({ notes: updatedNote || null })
+                                            .eq('id', item.id);
+                                          if (error) throw error;
+                                          setWorkouts((current) => current.map((workout) =>
+                                            workout.id === item.id ? { ...workout, notes: updatedNote } : workout
+                                          ));
+                                          setEditingHistoryNoteId(null);
+                                          Alert.alert('Saved', 'Exercise note updated.');
+                                        } catch (error) {
+                                          Alert.alert('Note Save Error', error.message || 'Could not update this note.');
+                                        }
+                                      }}
+                                      style={styles.confirmAddExerciseButton}
+                                    >
+                                      <Text style={styles.confirmAddExerciseText}>Save note</Text>
+                                    </TouchableOpacity>
+                                  </View>
+                                </View>
+                              )}
+                            </View>
+                          ))}
+                        </View>
+                      </View>
+                    );
+                  });
+                })()
+              )}
+            </>
           )}
         </ScrollView>
       )}
